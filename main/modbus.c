@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
@@ -16,38 +17,28 @@
 
 #define TAG "MODBUS_SYS"
 
-// ---------------- UART (USB INPUT) ----------------
+// ---------------- UART CONFIG ----------------
 #define UART_PORT UART_NUM_0
 #define BUF_SIZE 512
 
-// ---------------- MODBUS UART ----------------
+// ---------------- MODBUS CONFIG ----------------
 #define MB_UART_PORT UART_NUM_2
 #define MB_TX GPIO_NUM_17
 #define MB_RX GPIO_NUM_16
 #define MB_RTS GPIO_NUM_4
-#define BAUD 9600
 
-#define SLAVE_TIMEOUT_MS 1000
+#define BAUD_RATE 9600
 
-// ---------------- GLOBALS ----------------
-typedef enum {
-    MODE_NONE,
-    MODE_REQUEST,
-    MODE_CONTINUOUS
-} system_mode_t;
-
-system_mode_t current_mode = MODE_NONE;
-bool mode_set = false;
-
+// ---------------- GLOBAL ----------------
 void* master_handler = NULL;
 
 // ---------------- MODBUS INIT ----------------
-void modbus_init()
+void modbus_init(void)
 {
     mb_communication_info_t comm = {
         .ser_opts.port = MB_UART_PORT,
         .ser_opts.mode = MB_RTU,
-        .ser_opts.baudrate = BAUD,
+        .ser_opts.baudrate = BAUD_RATE,
         .ser_opts.parity = MB_PARITY_NONE,
         .ser_opts.uid = 0,
         .ser_opts.response_tout_ms = 1000,
@@ -60,36 +51,14 @@ void modbus_init()
     ESP_ERROR_CHECK(uart_set_pin(MB_UART_PORT, MB_TX, MB_RX, MB_RTS, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_set_mode(MB_UART_PORT, UART_MODE_RS485_HALF_DUPLEX));
 
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     ESP_ERROR_CHECK(mbc_master_start(master_handler));
 
     ESP_LOGI(TAG, "Modbus Master Initialized");
 }
 
-// ---------------- MODBUS READ ----------------
-uint16_t read_modbus(uint8_t sid, uint16_t ra)
-{
-    uint16_t data[1] = {0};
-
-    mb_param_request_t req = {
-        .slave_addr = sid,
-        .command = 0x03,
-        .reg_start = ra,
-        .reg_size = 1
-    };
-
-    esp_err_t err = mbc_master_send_request(master_handler, &req, data);
-
-    if (err == ESP_OK) {
-        return data[0];
-    } else {
-        ESP_LOGE(TAG, "Read fail SID:%d RA:%d", sid, ra);
-        return 0;
-    }
-}
-
-// ---------------- HELPERS ----------------
+// ---------------- HELPER ----------------
 int extract_number(char *str, const char *key)
 {
     char *ptr = strstr(str, key);
@@ -97,75 +66,128 @@ int extract_number(char *str, const char *key)
     return atoi(ptr + strlen(key));
 }
 
-// MODE HANDLER
-void handle_mode(char *cmd)
+void uart_printf(const char *fmt, ...)
 {
-    if (strstr(cmd, "REQUEST")) {
-        current_mode = MODE_REQUEST;
-        mode_set = true;
-        printf("MODE|REQUEST|OK\n");
-    }
-    else if (strstr(cmd, "CONTINUOUS")) {
-        current_mode = MODE_CONTINUOUS;
-        mode_set = true;
-        printf("MODE|CONTINUOUS|OK\n");
-    }
-    else {
-        printf("MODE|ERROR\n");
-    }
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    if (len > 0)
+        uart_write_bytes(UART_PORT, buf, len);
 }
 
 // ---------------- SLAVE COMMAND ----------------
 void handle_slave_command(char *cmd)
 {
-    if (!mode_set) {
-        printf("ERROR|MODE_NOT_SET\n");
-        return;
-    }
-
     int sid = extract_number(cmd, "SLAVE_ID:");
 
-    printf("SLAVE_ID:%d", sid);
+    uart_printf("SLAVE_ID:%d", sid);
 
     char *block = cmd;
-    int block_count = 0; // [MODIFIED] Added 'block_count' counter for up to 10 limits
+    int block_count = 0;
 
-    // [MODIFIED] Added '&& block_count < 10' condition to limit commands to B1..B10 limit
     while ((block = strstr(block, "{")) != NULL && block_count < 10)
     {
         char name[5] = {0};
         int ra = extract_number(block, "RA:");
-        int rc = extract_number(block, "RC:"); // [MODIFIED] Added RC extraction command to parse the count.
+        int rc = extract_number(block, "RC:");
 
-        // Currently we read 1 value per query as defined in your read_modbus
-        // but we extract RC to ensure it doesn't break parsing.
-        
-        // [MODIFIED] Added '4' inside sscanf %4[^|] to prevent overflowing memory beyond 4 length blocks (B10 is 3 length).
-        sscanf(block, "{%4[^|]", name);  // Extract B1, B2...
+        sscanf(block, "{%4[^|]", name);
 
-        uint16_t value = read_modbus(sid, ra);
+        uint16_t data[2] = {0};
+        esp_err_t err;
 
-        // [MODIFIED] Output format updated to output exactly: |{B1|RA:123}
-        printf("|{%s|RA:%d}", name, value);
+        // 🔥 CASE: RC = 2 (32-bit read)
+        if (rc == 2)
+        {
+            mb_param_request_t req = {
+                .slave_addr = sid,
+                .command = 0x03,
+                .reg_start = ra,
+                .reg_size = 2
+            };
 
-        block++; // move forward
-        block_count++; // [MODIFIED] Increment block tracking index
+            err = mbc_master_send_request(master_handler, &req, data);
+
+            if (err == ESP_OK)
+            {
+                uint32_t combined = ((uint32_t)data[0] << 16) | data[1];
+
+                float value;
+                memcpy(&value, &combined, sizeof(float));
+
+                uart_printf("|{%s:%.3f}", name, value);
+            }
+            else
+            {
+                uart_printf("|{%s|ERROR}", name);
+            }
+        }
+
+        // 🔥 CASE: RC = 1 (single register)
+        else if (rc == 1)
+        {
+            uint16_t val = 0;
+
+            mb_param_request_t req = {
+                .slave_addr = sid,
+                .command = 0x03,
+                .reg_start = ra,
+                .reg_size = 1
+            };
+
+            err = mbc_master_send_request(master_handler, &req, &val);
+
+            // fallback for paired-register devices
+            if (err != ESP_OK)
+            {
+                uint16_t temp[2];
+
+                mb_param_request_t fallback = {
+                    .slave_addr = sid,
+                    .command = 0x03,
+                    .reg_start = ra,
+                    .reg_size = 2
+                };
+
+                if (mbc_master_send_request(master_handler, &fallback, temp) == ESP_OK)
+                {
+                    uart_printf("|{%s:%d}", name, temp[0]);
+                }
+                else
+                {
+                    uart_printf("|{%s|ERROR}", name);
+                }
+            }
+            else
+            {
+                uart_printf("|{%s:%d}", name, val);
+            }
+        }
+        else
+        {
+            uart_printf("|{%s|INVALID_RC}", name);
+        }
+
+        block++;
+        block_count++;
     }
 
-    printf("\n");
+    uart_printf("\n");
 }
 
 // ---------------- COMMAND PROCESSOR ----------------
 void process_command(char *cmd)
 {
-    if (strncmp(cmd, "MODE|SET|", 9) == 0) {
-        handle_mode(cmd);
-    }
-    else if (strncmp(cmd, "SLAVE_ID:", 9) == 0) {
+    if (strncmp(cmd, "SLAVE_ID:", 9) == 0)
+    {
         handle_slave_command(cmd);
     }
-    else {
-        printf("UNKNOWN_CMD\n");
+    else
+    {
+        uart_printf("UNKNOWN_CMD\n");
     }
 }
 
@@ -175,7 +197,7 @@ void uart_task(void *arg)
     char line[512];
     int idx = 0;
 
-    printf("\n>> Ready for Commands\n");
+    uart_printf("\r\n>> ");
 
     while (1)
     {
@@ -183,23 +205,34 @@ void uart_task(void *arg)
 
         if (uart_read_bytes(UART_PORT, &ch, 1, portMAX_DELAY))
         {
-            if (ch == '\n' || ch == '\r')
+            if (ch == '\r')
             {
+                uart_write_bytes(UART_PORT, "\r\n", 2);
+
                 if (idx > 0)
                 {
                     line[idx] = '\0';
-
-                    ESP_LOGI(TAG, "CMD: %s", line);
-
                     process_command(line);
-
                     idx = 0;
                 }
+
+                uart_printf(">> ");
             }
-            else
+            else if (ch == 0x08 || ch == 0x7F)
+            {
+                if (idx > 0)
+                {
+                    idx--;
+                    uart_write_bytes(UART_PORT, "\b \b", 3);
+                }
+            }
+            else if (ch >= 32 && ch <= 126)
             {
                 if (idx < sizeof(line) - 1)
+                {
                     line[idx++] = ch;
+                    uart_write_bytes(UART_PORT, (char *)&ch, 1);
+                }
             }
         }
     }
@@ -208,7 +241,8 @@ void uart_task(void *arg)
 // ---------------- MAIN ----------------
 void app_main(void)
 {
-    // UART for terminal
+    esp_log_level_set("*", ESP_LOG_NONE); // clean terminal
+
     uart_driver_install(UART_PORT, BUF_SIZE * 2, 0, 0, NULL, 0);
 
     modbus_init();
