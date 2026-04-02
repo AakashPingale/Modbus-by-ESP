@@ -1,0 +1,22 @@
+# ESP-IDF gitignore
+build/
+sdkconfig.old
+sdkconfig.backup
+managed_components/
+dependencies.lock
+*.log
+*.txt
+.antigravity/
+.gemini/
+.idea/
+.vscode/
+node_modules/
+dist/
+out.txt
+err.txt
+build_log_final.txt
+build_log_utf8.txt
+build_log.txt
+temp_build.log
+temp_build_utf8.log
+build_err_utf8.txt
